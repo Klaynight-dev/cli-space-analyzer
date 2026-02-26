@@ -23,8 +23,32 @@ void* loader_thread(void* arg) {
     struct timespec ts = {0, 100000000}; // 100ms
 
     while (!stop_loader) {
-        printf("\r\033[94m%s\033[0m Analyse en cours...", chars[i % 4]);
+        // compute elapsed time
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - start_time.tv_sec) +
+                         (now.tv_nsec - start_time.tv_nsec) / 1e9;
+        double est = 0;
+        if (total_items > 0 && scanned_items > 0) {
+            est = elapsed * ((double)total_items / scanned_items);
+        }
+
+        // determine message prefix (counting vs scanning)
+        const char* phase = is_counting ? "Comptage" : "Analyse";
+
+        printf("\r\033[94m%s\033[0m %s en cours... ", chars[i % 4], phase);
+        if (current_path[0]) {
+            printf("%s ", current_path);
+        }
+        if (total_items > 0) {
+            printf("[%.0f/%.0f] ", (double)scanned_items, (double)total_items);
+        }
+        printf("%ds écoulés", (int)elapsed);
+        if (est > 0) {
+            printf(", estimé %ds", (int)est);
+        }
         fflush(stdout);
+
         i++;
         nanosleep(&ts, NULL);
     }
@@ -78,6 +102,36 @@ static void normalize_path(char *p) {
 }
 
 // Parcours récursif du dossier
+// fonction auxiliaire pour compter le nombre total d'entrées (fichiers + dossiers)
+long long count_entries(const char* path, int current_depth, int max_depth) {
+    long long count = 1; // compte le dossier/cible lui‑même
+    DIR *dir = opendir(path);
+    if (!dir) return count;
+
+    struct dirent *entry;
+    char full_path[2048];
+    struct stat statbuf;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        if (stat(full_path, &statbuf) != 0) continue;
+
+        // mise à jour pour l'affichage du loader
+        strncpy(current_path, full_path, sizeof(current_path)-1);
+        current_path[sizeof(current_path)-1] = '\0';
+
+        scanned_items++;
+        count++;
+
+        if (S_ISDIR(statbuf.st_mode) && current_depth < max_depth) {
+            count += count_entries(full_path, current_depth + 1, max_depth);
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
 Node* scan_directory(const char* path, int current_depth, int max_depth) {
     Node* root = create_node(path, 1);
     DIR *dir = opendir(path);
@@ -92,11 +146,15 @@ Node* scan_directory(const char* path, int current_depth, int max_depth) {
 
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
         
         struct stat statbuf;
         if (stat(full_path, &statbuf) != 0) continue;
+
+        // mise à jour pour l'affichage du loader
+        strncpy(current_path, full_path, sizeof(current_path)-1);
+        current_path[sizeof(current_path)-1] = '\0';
+        scanned_items++;
 
         if (S_ISDIR(statbuf.st_mode)) {
             Node* child_dir = scan_directory(full_path, current_depth + 1, max_depth);
@@ -186,10 +244,22 @@ int main() {
 
     int max_depth = (strlen(depth_str) == 0) ? 9999 : atoi(depth_str);
 
+    // préparation des compteurs/progrès
+    scanned_items = 0;
+    total_items = 0;
+    is_counting = 1;
+
     // Lancement du loader
     pthread_t thread_id;
     stop_loader = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
     pthread_create(&thread_id, NULL, loader_thread, NULL);
+
+    // première passe : compter les entrées pour estimer
+    total_items = count_entries(path, 0, max_depth);
+    is_counting = 0;
+    // on recommence le compteur pour l'analyse propre
+    scanned_items = 0;
 
     // Scan
     Node* tree = scan_directory(path, 0, max_depth);
