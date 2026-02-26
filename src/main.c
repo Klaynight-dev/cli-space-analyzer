@@ -36,16 +36,28 @@ void* loader_thread(void* arg) {
         // determine message prefix (counting vs scanning)
         const char* phase = is_counting ? "Comptage" : "Analyse";
 
-        printf("\r\033[94m%s\033[0m %s en cours... ", chars[i % 4], phase);
+        char display_path[80] = "";
         if (current_path[0]) {
-            printf("%s ", current_path);
+            const char *p = current_path;
+            int len = strlen(p);
+            if (len > 60) {
+                snprintf(display_path, sizeof(display_path), "...%s", p + len - 57);
+            } else {
+                strncpy(display_path, p, sizeof(display_path) - 1);
+                display_path[sizeof(display_path)-1] = '\0';
+            }
+        }
+
+        printf("\r\033[K\033[94m%s\033[0m %s", chars[i % 4], phase);
+        if (display_path[0]) {
+            printf(" %s", display_path);
         }
         if (total_items > 0) {
-            printf("[%.0f/%.0f] ", (double)scanned_items, (double)total_items);
+            printf(" [%.0f/%.0f]", (double)scanned_items, (double)total_items);
         }
-        printf("%ds écoulés", (int)elapsed);
+        printf(" %ds", (int)elapsed);
         if (est > 0) {
-            printf(", estimé %ds", (int)est);
+            printf(" sur %ds estimé", (int)est);
         }
         fflush(stdout);
 
@@ -106,7 +118,12 @@ static void normalize_path(char *p) {
 long long count_entries(const char* path, int current_depth, int max_depth) {
     long long count = 1; // compte le dossier/cible lui‑même
     DIR *dir = opendir(path);
-    if (!dir) return count;
+    if (!dir) {
+        printf("\n");
+        perror(path);
+        stop_loader = 1;
+        return count;
+    }
 
     struct dirent *entry;
     char full_path[2048];
@@ -137,7 +154,9 @@ Node* scan_directory(const char* path, int current_depth, int max_depth) {
     DIR *dir = opendir(path);
     
     if (!dir) {
+        printf("\n");
         perror(path);
+        stop_loader = 1;
         return root; // Accès refusé ou erreur
     }
 
