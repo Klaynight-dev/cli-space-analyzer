@@ -1,6 +1,5 @@
 void format_size(long long size_bytes, char *buffer);
 void* loader_thread(void* arg);
-long long count_entries(const char* path, int current_depth, int max_depth);
 int compare_nodes(const void* a, const void* b);
 Node* create_node(const char* name, int is_dir);
 void add_child(Node* parent, Node* child);

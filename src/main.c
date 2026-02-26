@@ -1,8 +1,5 @@
 #include "./include.h"
-#include "./typedef.h"
-#include "./def.h"
-#include "./define.h"
-#include "./var.h"
+
 
 // Formatage de la taille
 void format_size(long long size_bytes, char *buffer) {
@@ -28,17 +25,26 @@ void* loader_thread(void* arg) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - start_time.tv_sec) +
                          (now.tv_nsec - start_time.tv_nsec) / 1e9;
-        double est = 0;
-        if (total_items > 0 && scanned_items > 0) {
-            est = elapsed * ((double)total_items / scanned_items);
+        double est_remain = 0;
+        if (total_items > 0 && scanned_items > 0 && total_items > scanned_items) {
+            // predicted remaining time based on current rate
+            est_remain = elapsed * ((double)(total_items - scanned_items) / scanned_items);
         }
 
-        // determine message prefix (counting vs scanning)
-        const char* phase = is_counting ? "Comptage" : "Analyse";
+        const char* phase = "Analyse";
 
         char display_path[80] = "";
         if (current_path[0]) {
-            const char *p = current_path;
+            char clean[2048];
+            int ci = 0;
+            for (int j = 0; current_path[j] && ci < (int)sizeof(clean)-1; ++j) {
+                unsigned char c = current_path[j];
+                if (c >= 32 && c != 127) {
+                    clean[ci++] = c;
+                }
+            }
+            clean[ci] = '\0';
+            const char *p = clean;
             int len = strlen(p);
             if (len > 60) {
                 snprintf(display_path, sizeof(display_path), "...%s", p + len - 57);
@@ -56,8 +62,8 @@ void* loader_thread(void* arg) {
             printf(" [%.0f/%.0f]", (double)scanned_items, (double)total_items);
         }
         printf(" %ds", (int)elapsed);
-        if (est > 0) {
-            printf(" sur %ds estimé", (int)est);
+        if (est_remain > 0) {
+            printf(" restants %ds", (int)est_remain);
         }
         fflush(stdout);
 
@@ -114,43 +120,10 @@ static void normalize_path(char *p) {
 }
 
 // Parcours récursif du dossier
-// fonction auxiliaire pour compter le nombre total d'entrées (fichiers + dossiers)
-long long count_entries(const char* path, int current_depth, int max_depth) {
-    long long count = 1; // compte le dossier/cible lui‑même
-    DIR *dir = opendir(path);
-    if (!dir) {
-        printf("\n");
-        perror(path);
-        stop_loader = 1;
-        return count;
-    }
-
-    struct dirent *entry;
-    char full_path[2048];
-    struct stat statbuf;
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        if (stat(full_path, &statbuf) != 0) continue;
-
-        // mise à jour pour l'affichage du loader
-        strncpy(current_path, full_path, sizeof(current_path)-1);
-        current_path[sizeof(current_path)-1] = '\0';
-
-        scanned_items++;
-        count++;
-
-        if (S_ISDIR(statbuf.st_mode) && current_depth < max_depth) {
-            count += count_entries(full_path, current_depth + 1, max_depth);
-        }
-    }
-    closedir(dir);
-    return count;
-}
 
 Node* scan_directory(const char* path, int current_depth, int max_depth) {
     Node* root = create_node(path, 1);
+    total_items++; // count this directory itself
     DIR *dir = opendir(path);
     
     if (!dir) {
@@ -165,6 +138,7 @@ Node* scan_directory(const char* path, int current_depth, int max_depth) {
 
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        total_items++; // discovered another entry
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
         
         struct stat statbuf;
@@ -266,7 +240,6 @@ int main() {
     // préparation des compteurs/progrès
     scanned_items = 0;
     total_items = 0;
-    is_counting = 1;
 
     // Lancement du loader
     pthread_t thread_id;
@@ -274,13 +247,7 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     pthread_create(&thread_id, NULL, loader_thread, NULL);
 
-    // première passe : compter les entrées pour estimer
-    total_items = count_entries(path, 0, max_depth);
-    is_counting = 0;
-    // on recommence le compteur pour l'analyse propre
-    scanned_items = 0;
-
-    // Scan
+    // Scan (total_items will be incremented as we go)
     Node* tree = scan_directory(path, 0, max_depth);
 
     // Arrêt du loader
