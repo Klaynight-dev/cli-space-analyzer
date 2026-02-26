@@ -26,12 +26,13 @@ void* loader_thread(void* arg) {
         double elapsed = (now.tv_sec - start_time.tv_sec) +
                          (now.tv_nsec - start_time.tv_nsec) / 1e9;
         double est_remain = 0;
-        if (total_items > 0 && scanned_items > 0 && total_items > scanned_items) {
+        
+        if (is_analyzing && total_items > 0 && scanned_items > 0 && total_items > scanned_items) {
             // predicted remaining time based on current rate
             est_remain = elapsed * ((double)(total_items - scanned_items) / scanned_items);
         }
 
-        const char* phase = "Analyse";
+        const char* phase = is_analyzing ? "Analyse" : "Comptage";
 
         char display_path[80] = "";
         if (current_path[0]) {
@@ -58,11 +59,17 @@ void* loader_thread(void* arg) {
         if (display_path[0]) {
             printf(" %s", display_path);
         }
-        if (total_items > 0) {
-            printf(" [%.0f/%.0f]", (double)scanned_items, (double)total_items);
+        
+        if (is_analyzing) {
+            if (total_items > 0) {
+                printf(" [%lld/%lld]", scanned_items, total_items);
+            }
+        } else {
+            printf(" [%lld]", total_items);
         }
+
         printf(" %ds", (int)elapsed);
-        if (est_remain > 0) {
+        if (is_analyzing && est_remain > 0) {
             printf(" restants %ds", (int)est_remain);
         }
         fflush(stdout);
@@ -119,17 +126,58 @@ static void normalize_path(char *p) {
     }
 }
 
+// Pre-scan to count items quickly
+void count_items(const char* path) {
+    DIR *dir = opendir(path);
+    if (!dir) return;
+
+    struct dirent *entry;
+    char full_path[2048];
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        
+        total_items++;
+        
+        // Update display path occasionally or for deep scans if it doesn't slow down too much
+        // For pre-scan, we just want speed, but showing progress is nice
+        if (total_items % 100 == 0) {
+            strncpy(current_path, path, sizeof(current_path)-1);
+            current_path[sizeof(current_path)-1] = '\0';
+        }
+
+        int is_dir = 0;
+#ifdef _DIRENT_HAVE_D_TYPE
+        if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
+            is_dir = (entry->d_type == DT_DIR);
+        } else {
+#endif
+            struct stat statbuf;
+            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+            if (stat(full_path, &statbuf) == 0) {
+                is_dir = S_ISDIR(statbuf.st_mode);
+            }
+#ifdef _DIRENT_HAVE_D_TYPE
+        }
+#endif
+
+        if (is_dir) {
+            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+            count_items(full_path);
+        }
+    }
+    closedir(dir);
+}
+
 // Parcours récursif du dossier
 
 Node* scan_directory(const char* path, int current_depth, int max_depth) {
     Node* root = create_node(path, 1);
-    total_items++; // count this directory itself
     DIR *dir = opendir(path);
     
     if (!dir) {
         printf("\n");
         perror(path);
-        stop_loader = 1;
         return root; // Accès refusé ou erreur
     }
 
@@ -138,11 +186,14 @@ Node* scan_directory(const char* path, int current_depth, int max_depth) {
 
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        total_items++; // discovered another entry
+        
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
         
         struct stat statbuf;
-        if (stat(full_path, &statbuf) != 0) continue;
+        if (stat(full_path, &statbuf) != 0) {
+            scanned_items++; // count it even if stat fails to keep progress consistent
+            continue;
+        }
 
         // mise à jour pour l'affichage du loader
         strncpy(current_path, full_path, sizeof(current_path)-1);
@@ -244,10 +295,17 @@ int main() {
     // Lancement du loader
     pthread_t thread_id;
     stop_loader = 0;
+    is_analyzing = 0;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
     pthread_create(&thread_id, NULL, loader_thread, NULL);
 
-    // Scan (total_items will be incremented as we go)
+    // Pre-scan phase
+    count_items(path);
+    
+    // Switch to analysis phase
+    is_analyzing = 1;
+
+    // Scan (total_items is now stable)
     Node* tree = scan_directory(path, 0, max_depth);
 
     // Arrêt du loader

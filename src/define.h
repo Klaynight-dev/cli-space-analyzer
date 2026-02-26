@@ -6,7 +6,11 @@
 #define CYAN "\033[96m"
 #define GRAY "\033[90m"
 
-/* enable miscellaneous/GNU extensions (e.g. usleep) */
+/* enable miscellaneous/GNU extensions (e.g. usleep, DT_DIR) */
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
