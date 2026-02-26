@@ -21,7 +21,7 @@ void* loader_thread(void* arg) {
     struct timespec ts = {0, 100000000}; // 100ms
 
     while (!stop_loader) {
-        // compute elapsed time
+        // calcul du temps écoulé
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (now.tv_sec - start_time.tv_sec) +
@@ -29,7 +29,7 @@ void* loader_thread(void* arg) {
         double est_remain = 0;
         
         if (is_analyzing && total_items > 0 && scanned_items > 0 && total_items > scanned_items) {
-            // predicted remaining time based on current rate
+            // temps restant estimé basé sur le taux actuel
             est_remain = elapsed * ((double)(total_items - scanned_items) / scanned_items);
         }
 
@@ -101,19 +101,120 @@ Node* create_node(const char* name, int is_dir) {
     node->child_count = 0;
     node->child_capacity = 10;
     node->children = (Node**)malloc(node->child_capacity * sizeof(Node*));
+    pthread_mutex_init(&node->mutex, NULL);
     return node;
 }
 
-// Ajout d'un enfant à un noeud parent
 void add_child(Node* parent, Node* child) {
+    pthread_mutex_lock(&parent->mutex);
     if (parent->child_count >= parent->child_capacity) {
         parent->child_capacity *= 2;
         parent->children = (Node**)realloc(parent->children, parent->child_capacity * sizeof(Node*));
     }
     parent->children[parent->child_count++] = child;
+    pthread_mutex_unlock(&parent->mutex);
 }
 
-// normalize windows-style names (backslashes, drive letters) to Unix/WSL form
+void tq_push(const char *path, Node *parent) {
+    Task *task = (Task*)malloc(sizeof(Task));
+    task->path = strdup(path);
+    task->parent = parent;
+    task->next = NULL;
+
+    pthread_mutex_lock(&tq.mutex);
+    if (tq.tail) {
+        tq.tail->next = task;
+        tq.tail = task;
+    } else {
+        tq.head = tq.tail = task;
+    }
+    tq.count++;
+    pthread_cond_signal(&tq.cond);
+    pthread_mutex_unlock(&tq.mutex);
+}
+
+Task* tq_pop() {
+    pthread_mutex_lock(&tq.mutex);
+    while (tq.head == NULL && !tq.stop) {
+        pthread_cond_wait(&tq.cond, &tq.mutex);
+    }
+    if (tq.stop && tq.head == NULL) {
+        pthread_mutex_unlock(&tq.mutex);
+        return NULL;
+    }
+    Task *task = tq.head;
+    tq.head = task->next;
+    if (tq.head == NULL) tq.tail = NULL;
+    tq.count--;
+    tq.working_count++;
+    pthread_mutex_unlock(&tq.mutex);
+    return task;
+}
+
+void tq_finish_task() {
+    pthread_mutex_lock(&tq.mutex);
+    tq.working_count--;
+    if (tq.working_count == 0 && tq.head == NULL) {
+        pthread_cond_broadcast(&tq.cond);
+    }
+    pthread_mutex_unlock(&tq.mutex);
+}
+
+void* worker_thread(void* arg) {
+    (void)arg;
+    while (1) {
+        Task *task = tq_pop();
+        if (!task) break;
+
+        if (is_analyzing) {
+            scan_directory_recursive(task->parent, task->path, 1, max_depth_glob);
+        } else {
+            DIR *dir = opendir(task->path);
+            if (dir) {
+                struct dirent *entry;
+                char full_path[2048];
+                while ((entry = readdir(dir)) != NULL) {
+                    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+                    
+                    pthread_mutex_lock(&progress_mutex);
+                    total_items++;
+                    if (total_items % 100 == 0) {
+                        strncpy(current_path, task->path, sizeof(current_path)-1);
+                        current_path[sizeof(current_path)-1] = '\0';
+                    }
+                    pthread_mutex_unlock(&progress_mutex);
+
+                    int is_dir = 0;
+#ifdef _DIRENT_HAVE_D_TYPE
+                    if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
+                        is_dir = (entry->d_type == DT_DIR);
+                    } else {
+#endif
+                        struct stat statbuf;
+                        snprintf(full_path, sizeof(full_path), "%s/%s", task->path, entry->d_name);
+                        if (stat(full_path, &statbuf) == 0) {
+                            is_dir = S_ISDIR(statbuf.st_mode);
+                        }
+#ifdef _DIRENT_HAVE_D_TYPE
+                    }
+#endif
+                    if (is_dir) {
+                        snprintf(full_path, sizeof(full_path), "%s/%s", task->path, entry->d_name);
+                        tq_push(full_path, NULL);
+                    }
+                }
+                closedir(dir);
+            }
+        }
+
+        free(task->path);
+        free(task);
+        tq_finish_task();
+    }
+    return NULL;
+}
+
+// normalisation des noms de style Windows (backslashes, lettres de lecteur) vers le format Unix/WSL
 static void normalize_path(char *p) {
     if (!p || !*p) return;
     for (char *q = p; *q; ++q) {
@@ -127,8 +228,22 @@ static void normalize_path(char *p) {
     }
 }
 
-// Pre-scan to count items quickly
-void count_items(const char* path) {
+// Pré-scan pour compter les éléments rapidement
+
+void wait_tq_empty() {
+    pthread_mutex_lock(&tq.mutex);
+    while (tq.head != NULL || tq.working_count > 0) {
+        pthread_cond_wait(&tq.cond, &tq.mutex);
+    }
+    pthread_mutex_unlock(&tq.mutex);
+}
+
+void count_items_mt(const char* path) {
+    tq_push(path, NULL);
+    wait_tq_empty();
+}
+
+void scan_directory_recursive(Node* root, const char* path, int current_depth, int max_depth) {
     DIR *dir = opendir(path);
     if (!dir) return;
 
@@ -138,87 +253,80 @@ void count_items(const char* path) {
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
         
-        total_items++;
-        
-        // Update display path occasionally or for deep scans if it doesn't slow down too much
-        // For pre-scan, we just want speed, but showing progress is nice
-        if (total_items % 100 == 0) {
-            strncpy(current_path, path, sizeof(current_path)-1);
-            current_path[sizeof(current_path)-1] = '\0';
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        struct stat statbuf;
+        if (stat(full_path, &statbuf) != 0) {
+            pthread_mutex_lock(&progress_mutex);
+            scanned_items++;
+            pthread_mutex_unlock(&progress_mutex);
+            continue;
         }
 
-        int is_dir = 0;
-#ifdef _DIRENT_HAVE_D_TYPE
-        if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
-            is_dir = (entry->d_type == DT_DIR);
-        } else {
-#endif
-            struct stat statbuf;
-            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-            if (stat(full_path, &statbuf) == 0) {
-                is_dir = S_ISDIR(statbuf.st_mode);
+        pthread_mutex_lock(&progress_mutex);
+        strncpy(current_path, full_path, sizeof(current_path)-1);
+        current_path[sizeof(current_path)-1] = '\0';
+        scanned_items++;
+        pthread_mutex_unlock(&progress_mutex);
+
+        if (S_ISDIR(statbuf.st_mode)) {
+            Node* child_dir = create_node(entry->d_name, 1);
+            scan_directory_recursive(child_dir, full_path, current_depth + 1, max_depth);
+            
+            pthread_mutex_lock(&root->mutex);
+            root->size += child_dir->size;
+            if (current_depth < max_depth) {
+                add_child(root, child_dir);
+            } else {
+                free_tree(child_dir);
             }
-#ifdef _DIRENT_HAVE_D_TYPE
-        }
-#endif
-
-        if (is_dir) {
-            snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-            count_items(full_path);
+            pthread_mutex_unlock(&root->mutex);
+        } else {
+            pthread_mutex_lock(&root->mutex);
+            root->size += statbuf.st_size;
+            if (current_depth < max_depth) {
+                Node* child_file = create_node(entry->d_name, 0);
+                child_file->size = statbuf.st_size;
+                add_child(root, child_file);
+            }
+            pthread_mutex_unlock(&root->mutex);
         }
     }
     closedir(dir);
 }
 
-// Parcours récursif du dossier
-
-Node* scan_directory(const char* path, int current_depth, int max_depth) {
+// Scan parallèle pour le niveau supérieur
+Node* scan_directory_mt(const char* path, int max_depth) {
     Node* root = create_node(path, 1);
     DIR *dir = opendir(path);
-    
-    if (!dir) {
-        printf("\n");
-        perror(path);
-        return root; // Accès refusé ou erreur
-    }
+    if (!dir) return root;
 
     struct dirent *entry;
     char full_path[2048];
-
     while ((entry = readdir(dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
         
         snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
-        
         struct stat statbuf;
         if (stat(full_path, &statbuf) != 0) {
-            scanned_items++; // count it even if stat fails to keep progress consistent
+            pthread_mutex_lock(&progress_mutex);
+            scanned_items++;
+            pthread_mutex_unlock(&progress_mutex);
             continue;
         }
 
-        // mise à jour pour l'affichage du loader
+        pthread_mutex_lock(&progress_mutex);
         strncpy(current_path, full_path, sizeof(current_path)-1);
         current_path[sizeof(current_path)-1] = '\0';
         scanned_items++;
+        pthread_mutex_unlock(&progress_mutex);
 
         if (S_ISDIR(statbuf.st_mode)) {
-            Node* child_dir = scan_directory(full_path, current_depth + 1, max_depth);
-            root->size += child_dir->size;
-            
-            if (current_depth < max_depth) {
-                // Remplacer le chemin complet par juste le nom du dossier pour l'affichage
-                free(child_dir->name);
-                child_dir->name = strdup(entry->d_name);
-                add_child(root, child_dir);
-            } else {
-                // Libérer si on ne garde pas pour l'affichage
-                free(child_dir->name);
-                free(child_dir->children);
-                free(child_dir);
-            }
+            Node* child_dir = create_node(entry->d_name, 1);
+            tq_push(full_path, child_dir);
+            add_child(root, child_dir);
         } else {
             root->size += statbuf.st_size;
-            if (current_depth < max_depth) {
+            if (max_depth > 0) {
                 Node* child_file = create_node(entry->d_name, 0);
                 child_file->size = statbuf.st_size;
                 add_child(root, child_file);
@@ -227,13 +335,16 @@ Node* scan_directory(const char* path, int current_depth, int max_depth) {
     }
     closedir(dir);
 
-    // Tri des enfants
-    qsort(root->children, root->child_count, sizeof(Node*), compare_nodes);
+    wait_tq_empty();
 
+    for (int i = 0; i < root->child_count; i++) {
+        root->size += root->children[i]->size;
+    }
+
+    qsort(root->children, root->child_count, sizeof(Node*), compare_nodes);
     return root;
 }
 
-// Affichage de l'arbre
 void print_tree(Node* node, const char* prefix, int is_last, int is_root) {
     char size_str[32];
     format_size(node->size, size_str);
@@ -288,30 +399,53 @@ int main() {
     depth_str[strcspn(depth_str, "\r\n")] = 0;
 
     int max_depth = (strlen(depth_str) == 0) ? 9999 : atoi(depth_str);
+    max_depth_glob = max_depth;
+
+    pthread_mutex_init(&progress_mutex, NULL);
+    pthread_mutex_init(&tq.mutex, NULL);
+    pthread_cond_init(&tq.cond, NULL);
+    tq.head = tq.tail = NULL;
+    tq.count = 0;
+    tq.working_count = 0;
+    tq.stop = 0;
 
     // préparation des compteurs/progrès
     scanned_items = 0;
     total_items = 0;
 
+    // Lancement des workers
+    pthread_t workers[8];
+    for (int i = 0; i < 8; i++) {
+        pthread_create(&workers[i], NULL, worker_thread, NULL);
+    }
+
     // Lancement du loader
-    pthread_t thread_id;
+    pthread_t loader_tid;
     stop_loader = 0;
     is_analyzing = 0;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
-    pthread_create(&thread_id, NULL, loader_thread, NULL);
+    pthread_create(&loader_tid, NULL, loader_thread, NULL);
 
     // Pre-scan phase
-    count_items(path);
+    count_items_mt(path);
     
     // Switch to analysis phase
     is_analyzing = 1;
 
     // Scan (total_items is now stable)
-    Node* tree = scan_directory(path, 0, max_depth);
+    Node* tree = scan_directory_mt(path, max_depth);
 
-    // Arrêt du loader
+    // Arrêt du loader et des workers
     stop_loader = 1;
-    pthread_join(thread_id, NULL);
+    pthread_join(loader_tid, NULL);
+
+    pthread_mutex_lock(&tq.mutex);
+    tq.stop = 1;
+    pthread_cond_broadcast(&tq.cond);
+    pthread_mutex_unlock(&tq.mutex);
+    for (int i = 0; i < 8; i++) {
+        pthread_join(workers[i], NULL);
+    }
 
     // Affichage de l'arbre
     printf("\n");

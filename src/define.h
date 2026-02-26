@@ -6,7 +6,7 @@
 #define CYAN "\033[96m"
 #define GRAY "\033[90m"
 
-/* enable miscellaneous/GNU extensions (e.g. usleep, DT_DIR) */
+/* activer les extensions diverses/GNU (ex: usleep, DT_DIR) */
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
@@ -15,7 +15,7 @@
 #define _GNU_SOURCE
 #endif
 
-/* ensure POSIX features like strdup are declared */
+/* s'assurer que les fonctionnalités POSIX comme strdup sont déclarées */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
