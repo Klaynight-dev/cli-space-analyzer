@@ -8,3 +8,4 @@ Node* scan_directory_mt(const char* path, int max_depth);
 void print_tree(Node* node, const char* prefix, int is_last, int is_root);
 void free_tree(Node* node);
 void scan_directory_recursive(Node* root, const char* path, int current_depth, int max_depth);
+void delete_empty_dirs(const char* path);

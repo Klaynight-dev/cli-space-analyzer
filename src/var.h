@@ -2,6 +2,7 @@ int stop_loader = 0;              // Indicateur pour arrêter le thread du charg
 int is_analyzing = 0;             // 0 = phase de comptage, 1 = phase d'analyse
 volatile long long scanned_items = 0;
 volatile long long total_items = 0;
+volatile long long current_total_size = 0;
 char current_path[2048] = {0};
 struct timespec start_time;
 

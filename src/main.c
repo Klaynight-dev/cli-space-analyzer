@@ -56,6 +56,9 @@ void* loader_thread(void* arg) {
             }
         }
 
+        char size_buf[32] = "";
+        format_size(current_total_size, size_buf);
+
         printf("\r\033[K\033[94m%s\033[0m %s", chars[i % 4], phase);
         if (display_path[0]) {
             printf(" %s", display_path);
@@ -69,6 +72,7 @@ void* loader_thread(void* arg) {
             printf(" [%lld]", total_items);
         }
 
+        printf(" (%s)", size_buf);
         printf(" %ds", (int)elapsed);
         if (is_analyzing && est_remain > 0) {
             printf(" restants %ds", (int)est_remain);
@@ -184,23 +188,30 @@ void* worker_thread(void* arg) {
                     }
                     pthread_mutex_unlock(&progress_mutex);
 
+                    snprintf(full_path, sizeof(full_path), "%s/%s", task->path, entry->d_name);
+                    struct stat statbuf;
+                    int has_stat = (stat(full_path, &statbuf) == 0);
+
                     int is_dir = 0;
 #ifdef _DIRENT_HAVE_D_TYPE
                     if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_LNK) {
                         is_dir = (entry->d_type == DT_DIR);
                     } else {
 #endif
-                        struct stat statbuf;
-                        snprintf(full_path, sizeof(full_path), "%s/%s", task->path, entry->d_name);
-                        if (stat(full_path, &statbuf) == 0) {
+                        if (has_stat) {
                             is_dir = S_ISDIR(statbuf.st_mode);
                         }
 #ifdef _DIRENT_HAVE_D_TYPE
                     }
 #endif
                     if (is_dir) {
-                        snprintf(full_path, sizeof(full_path), "%s/%s", task->path, entry->d_name);
                         tq_push(full_path, NULL);
+                    } else {
+                        if (has_stat) {
+                            pthread_mutex_lock(&progress_mutex);
+                            current_total_size += statbuf.st_size;
+                            pthread_mutex_unlock(&progress_mutex);
+                        }
                     }
                 }
                 closedir(dir);
@@ -281,6 +292,9 @@ void scan_directory_recursive(Node* root, const char* path, int current_depth, i
             }
             pthread_mutex_unlock(&root->mutex);
         } else {
+            pthread_mutex_lock(&progress_mutex);
+            current_total_size += statbuf.st_size;
+            pthread_mutex_unlock(&progress_mutex);
             pthread_mutex_lock(&root->mutex);
             root->size += statbuf.st_size;
             if (current_depth < max_depth) {
@@ -325,6 +339,9 @@ Node* scan_directory_mt(const char* path, int max_depth) {
             tq_push(full_path, child_dir);
             add_child(root, child_dir);
         } else {
+            pthread_mutex_lock(&progress_mutex);
+            current_total_size += statbuf.st_size;
+            pthread_mutex_unlock(&progress_mutex);
             root->size += statbuf.st_size;
             if (max_depth > 0) {
                 Node* child_file = create_node(entry->d_name, 0);
@@ -372,6 +389,48 @@ void print_tree(Node* node, const char* prefix, int is_last, int is_root) {
     }
 }
 
+// Vérifie si un dossier est vide
+int is_dir_empty(const char *path) {
+    int count = 0;
+    DIR *dir = opendir(path);
+    if (!dir) return 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            count++;
+            break;
+        }
+    }
+    closedir(dir);
+    return count == 0;
+}
+
+// Supprime récursivement les dossiers vides
+void delete_empty_dirs(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir) return;
+
+    struct dirent *entry;
+    char full_path[2048];
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        struct stat statbuf;
+        if (stat(full_path, &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+            delete_empty_dirs(full_path);
+        }
+    }
+    closedir(dir);
+
+    if (is_dir_empty(path)) {
+        if (rmdir(path) == 0) {
+            printf("%s🗑️  Dossier vide supprimé : %s%s\n", GRAY, path, RESET);
+        }
+    }
+}
+
 // Libération de la mémoire
 void free_tree(Node* node) {
     for (int i = 0; i < node->child_count; i++) {
@@ -412,6 +471,7 @@ int main() {
     // préparation des compteurs/progrès
     scanned_items = 0;
     total_items = 0;
+    current_total_size = 0;
 
     // Lancement des workers
     pthread_t workers[8];
@@ -450,6 +510,23 @@ int main() {
     // Affichage de l'arbre
     printf("\n");
     print_tree(tree, "", 1, 1);
+
+    // Calcul du temps total
+    struct timespec end_time;
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    double total_elapsed = (end_time.tv_sec - start_time.tv_sec) +
+                           (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+    
+    printf("\n%s⏱️  Temps total d'exécution : %.2fs%s\n", BOLD, total_elapsed, RESET);
+
+    // Proposition de suppression des dossiers vides
+    printf("\n%s🧹 Voulez-vous supprimer les dossiers vides dans ce chemin ? (y/n) : %s", CYAN, RESET);
+    char choice[10];
+    if (fgets(choice, sizeof(choice), stdin) != NULL && (choice[0] == 'y' || choice[0] == 'Y')) {
+        printf("%s🔍 Recherche et suppression des dossiers vides...%s\n", GRAY, RESET);
+        delete_empty_dirs(path);
+        printf("%s✅ Suppression terminée.%s\n", BOLD, RESET);
+    }
 
     // Libération de la mémoire
     free_tree(tree);
